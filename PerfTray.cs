@@ -203,6 +203,10 @@ namespace PerfTray
         const int SW_HIDE = 0, SW_SHOWNOACTIVATE = 4;
         #endregion
 
+        // Sprache folgt der Windows-Anzeigesprache: Deutsch, sonst Englisch
+        static readonly bool German = System.Globalization.CultureInfo.CurrentUICulture.TwoLetterISOLanguageName == "de";
+        static string T(string de, string en) { return German ? de : en; }
+
         const string RunKey = @"Software\Microsoft\Windows\CurrentVersion\Run";
         readonly string settingsPath = Path.Combine(
             Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "PerfTray", "settings.ini");
@@ -352,7 +356,7 @@ namespace PerfTray
             }
 
             if (On("DISKACT"))
-                items.Add(new Item { Key = "ACT", Text = "Disk-Aktivität: " + Pct(sampler.DiskActivity), Hot = sampler.DiskActivity >= 90 });
+                items.Add(new Item { Key = "ACT", Text = T("Disk-Aktivität: ", "Disk activity: ") + Pct(sampler.DiskActivity), Hot = sampler.DiskActivity >= 90 });
             return items;
         }
 
@@ -543,21 +547,21 @@ namespace PerfTray
         {
             switch (id)
             {
-                case "CPU": return "CPU-Auslastung";
-                case "GPU": return "GPU-Auslastung";
+                case "CPU": return T("CPU-Auslastung", "CPU usage");
+                case "GPU": return T("GPU-Auslastung", "GPU usage");
                 case "RAM%": return "RAM in %";
                 case "RAMGB": return "RAM in GB";
-                case "DISKACT": return "Datenträger-Aktivität";
+                case "DISKACT": return T("Datenträger-Aktivität", "Disk activity");
             }
             string letter = id.Substring(id.IndexOf(':') + 1);
-            return "Laufwerk " + letter + ": belegt in " + (id.StartsWith("DISK%") ? "%" : "GB");
+            return T("Laufwerk ", "Drive ") + letter + T(": belegt in ", ": used in ") + (id.StartsWith("DISK%") ? "%" : "GB");
         }
 
         void BuildMenu()
         {
             menu.Items.Clear();
 
-            var title = new ToolStripMenuItem("PerfTray – anzeigen:") { Enabled = false };
+            var title = new ToolStripMenuItem(T("PerfTray – anzeigen:", "PerfTray – show:")) { Enabled = false };
             title.Font = new Font(title.Font, FontStyle.Bold);
             menu.Items.Add(title);
 
@@ -588,30 +592,30 @@ namespace PerfTray
 
             menu.Items.Add(new ToolStripSeparator());
 
-            var interval = new ToolStripMenuItem("Aktualisierung");
+            var interval = new ToolStripMenuItem(T("Aktualisierung", "Update interval"));
             foreach (var ms in new[] { 1000, 2000, 5000 })
             {
                 int v = ms;
-                var it = new ToolStripMenuItem("alle " + (v / 1000) + " s") { Checked = sampler.IntervalMs == v };
+                var it = new ToolStripMenuItem(T("alle ", "every ") + (v / 1000) + " s") { Checked = sampler.IntervalMs == v };
                 it.Click += (s, e) => { sampler.IntervalMs = v; renderTimer.Interval = v; SaveSettings(); };
                 interval.DropDownItems.Add(it);
             }
             menu.Items.Add(interval);
 
-            var reset = new ToolStripMenuItem("Position zurücksetzen (neben die Uhr)");
+            var reset = new ToolStripMenuItem(T("Position zurücksetzen (neben die Uhr)", "Reset position (next to the clock)"));
             reset.Click += (s, e) => { fromRight = -1; SaveSettings(); Render(); };
             menu.Items.Add(reset);
 
-            var autostart = new ToolStripMenuItem("Mit Windows starten") { Checked = IsAutostart() };
+            var autostart = new ToolStripMenuItem(T("Mit Windows starten", "Start with Windows")) { Checked = IsAutostart() };
             autostart.Click += (s, e) => SetAutostart(!IsAutostart());
             menu.Items.Add(autostart);
 
-            var tm = new ToolStripMenuItem("Task-Manager öffnen");
+            var tm = new ToolStripMenuItem(T("Task-Manager öffnen", "Open Task Manager"));
             tm.Click += (s, e) => { try { Process.Start("taskmgr.exe"); } catch { } };
             menu.Items.Add(tm);
 
             menu.Items.Add(new ToolStripSeparator());
-            var exit = new ToolStripMenuItem("Beenden");
+            var exit = new ToolStripMenuItem(T("Beenden", "Exit"));
             exit.Click += (s, e) => Quit();
             menu.Items.Add(exit);
         }
