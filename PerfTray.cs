@@ -198,6 +198,9 @@ namespace PerfTray
         static extern bool UpdateLayeredWindow(IntPtr h, IntPtr dstDc, ref POINT dst, ref SIZE size,
             IntPtr srcDc, ref POINT src, int key, ref BLENDFUNCTION blend, int flags);
 
+        [DllImport("shell32.dll")]
+        static extern int SHGetKnownFolderPath([MarshalAs(UnmanagedType.LPStruct)] Guid id, uint flags, IntPtr token, out IntPtr path);
+
         static readonly IntPtr HWND_TOPMOST = new IntPtr(-1);
         const uint SWP_NOSIZE = 0x1, SWP_NOMOVE = 0x2, SWP_NOACTIVATE = 0x10;
         const int SW_HIDE = 0, SW_SHOWNOACTIVATE = 4;
@@ -213,6 +216,10 @@ namespace PerfTray
 
         readonly Sampler sampler = new Sampler();
         readonly List<string> enabled = new List<string>();
+        readonly List<string> favorites = new List<string>(); // Kennung wie "DOWNLOADS" oder "PATH:D:\Projekte"
+        readonly List<Rectangle> favCells = new List<Rectangle>(); // Klickflaechen der Favoriten (Fensterkoordinaten)
+        readonly ToolTip tip = new ToolTip();
+        int hoveredFav = -1;
         readonly Dictionary<string, float> columnWidth = new Dictionary<string, float>(); // waechst nur -> kein Zappeln
         readonly ContextMenuStrip menu = new ContextMenuStrip();
         readonly System.Windows.Forms.Timer renderTimer = new System.Windows.Forms.Timer();
@@ -237,16 +244,24 @@ namespace PerfTray
             sampler.Start();
 
             menu.Opening += (s, e) => BuildMenu();
-            menu.Closing += (s, e) =>
-            {
-                if (keepMenuOpen && e.CloseReason == ToolStripDropDownCloseReason.ItemClicked) e.Cancel = true;
-                keepMenuOpen = false;
-            };
+            menu.Closing += KeepOpenOnToggle;
 
             renderTimer.Interval = sampler.IntervalMs;
             renderTimer.Tick += (s, e) => Render();
             zTimer.Interval = 300;
             zTimer.Tick += (s, e) => KeepOnTaskbar();
+        }
+
+        // Beim An-/Abhaken bleibt das Menue offen (gilt auch fuer Untermenues)
+        void KeepOpenOnToggle(object sender, ToolStripDropDownClosingEventArgs e)
+        {
+            if (keepMenuOpen && e.CloseReason == ToolStripDropDownCloseReason.ItemClicked) e.Cancel = true;
+        }
+
+        void MarkKeepOpen()
+        {
+            keepMenuOpen = true;
+            BeginInvoke((Action)(() => keepMenuOpen = false));
         }
 
         protected override bool ShowWithoutActivation { get { return true; } }
@@ -336,7 +351,7 @@ namespace PerfTray
                 });
             }
 
-            var letters = enabled.Where(i => i.StartsWith("DISK%:") || i.StartsWith("DISKGB:"))
+            var letters = enabled.Where(i => i.StartsWith("DISK%:") || i.StartsWith("DISKGB:") || i.StartsWith("DISKFREE:"))
                                  .Select(i => i.Substring(i.IndexOf(':') + 1)).Distinct().OrderBy(l => l);
             foreach (var l in letters)
             {
@@ -348,7 +363,9 @@ namespace PerfTray
                     const double G = 1024.0 * 1024 * 1024;
                     double total = d.TotalSize / G, used = (d.TotalSize - d.TotalFreeSpace) / G;
                     float p = total > 0 ? (float)(used / total * 100) : 0;
-                    text = l + ": " + Join(On("DISK%:" + l) ? Pct(p) : null, On("DISKGB:" + l) ? GB(used) : null);
+                    string usedText = Join(On("DISK%:" + l) ? Pct(p) : null, On("DISKGB:" + l) ? GB(used) : null);
+                    string freeText = On("DISKFREE:" + l) ? GB(total - used) + T(" frei", " free") : null;
+                    text = l + ": " + (usedText != null && freeText != null ? usedText + " · " + freeText : usedText ?? freeText);
                     hot = p >= 90;
                 }
                 catch { }
@@ -358,6 +375,89 @@ namespace PerfTray
             if (On("DISKACT"))
                 items.Add(new Item { Key = "ACT", Text = T("Disk-Aktivität: ", "Disk activity: ") + Pct(sampler.DiskActivity), Hot = sampler.DiskActivity >= 90 });
             return items;
+        }
+
+        // ---------------- Favoriten-Ordner ----------------
+
+        static readonly string[] KnownFavorites = { "HOME", "DESKTOP", "DOWNLOADS", "DOCUMENTS", "PICTURES", "MUSIC", "VIDEOS", "TRASH" };
+
+        static string KnownFolder(string guid)
+        {
+            IntPtr p;
+            if (SHGetKnownFolderPath(new Guid(guid), 0, IntPtr.Zero, out p) != 0) return null;
+            try { return Marshal.PtrToStringUni(p); }
+            finally { Marshal.FreeCoTaskMem(p); }
+        }
+
+        // Pfad eines Favoriten (beruecksichtigt z. B. nach OneDrive verschobene Ordner)
+        static string FavPath(string id)
+        {
+            switch (id)
+            {
+                case "HOME": return KnownFolder("5E6C858F-0E22-4760-9AFE-EA3317B67173");
+                case "DESKTOP": return KnownFolder("B4BFCC3A-DB2C-424C-B029-7FE99A87C641");
+                case "DOWNLOADS": return KnownFolder("374DE290-123F-4565-9164-39C4925E467B");
+                case "DOCUMENTS": return KnownFolder("FDD39AD0-238F-46AF-ADB4-6C85480369C7");
+                case "PICTURES": return KnownFolder("33E28130-4E1E-4676-835A-98395C3BC3BB");
+                case "MUSIC": return KnownFolder("4BD8D571-6D19-48D3-BE97-422220080E43");
+                case "VIDEOS": return KnownFolder("18989B1D-99B5-455B-841C-AB7C74E4DDFC");
+                case "TRASH": return "shell:RecycleBinFolder";
+            }
+            return id.StartsWith("PATH:") ? id.Substring(5) : null;
+        }
+
+        static string FavName(string id)
+        {
+            switch (id)
+            {
+                case "HOME": return T("Benutzerordner", "User folder");
+                case "DESKTOP": return "Desktop";
+                case "DOWNLOADS": return "Downloads";
+                case "DOCUMENTS": return T("Dokumente", "Documents");
+                case "PICTURES": return T("Bilder", "Pictures");
+                case "MUSIC": return T("Musik", "Music");
+                case "VIDEOS": return "Videos";
+                case "TRASH": return T("Papierkorb", "Recycle Bin");
+            }
+            string path = FavPath(id) ?? "";
+            string name = Path.GetFileName(path.TrimEnd('\\'));
+            return string.IsNullOrEmpty(name) ? path : name;
+        }
+
+        static string FavIcon(string id)
+        {
+            switch (id)
+            {
+                case "HOME": return "house";
+                case "DESKTOP": return "monitor";
+                case "DOWNLOADS": return "download";
+                case "DOCUMENTS": return "file-text";
+                case "PICTURES": return "image";
+                case "MUSIC": return "music";
+                case "VIDEOS": return "video";
+                case "TRASH": return "trash-2";
+            }
+            string path = FavPath(id) ?? "";
+            return path.Length <= 3 && path.EndsWith(":\\") ? "hard-drive" : "folder";
+        }
+
+        // Bekannte Ordner in fester Reihenfolge, eigene Ordner dahinter
+        IEnumerable<string> OrderedFavorites()
+        {
+            return KnownFavorites.Where(favorites.Contains).Concat(favorites.Where(f => f.StartsWith("PATH:")));
+        }
+
+        void OpenFavorite(string id)
+        {
+            string path = FavPath(id);
+            if (path == null) return;
+            if (!path.StartsWith("shell:") && !Directory.Exists(path))
+            {
+                MessageBox.Show(T("Ordner nicht gefunden:\n", "Folder not found:\n") + path, "PerfTray",
+                    MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
+            try { Process.Start("explorer.exe", "\"" + path + "\""); } catch { }
         }
 
         static bool LightTheme()
@@ -404,10 +504,18 @@ namespace PerfTray
                 }
 
                 float pad = fontPx * 0.5f, gap = fontPx * 1.2f, lineH = fontPx * 1.32f;
-                int width = (int)Math.Ceiling(pad * 2 + widths.Sum() + gap * Math.Max(0, cols.Count - 1));
+
+                // Favoriten links vor den Werten
+                var favs = OrderedFavorites().ToList();
+                int cellW = (int)Math.Round(barH * 0.72f), cellH = (int)Math.Round(barH * 0.8f);
+                float iconPx = (float)Math.Round(barH * 0.42f);
+                float favW = favs.Count * cellW + (favs.Count > 0 && cols.Count > 0 ? gap * 0.6f : 0);
+
+                int width = (int)Math.Ceiling(pad * 2 + favW + widths.Sum() + gap * Math.Max(0, cols.Count - 1));
                 width = Math.Max(width, 20);
                 int height = barH;
                 float top = (height - rows * lineH) / 2f;
+                if (hoveredFav >= favs.Count) hoveredFav = -1;
 
                 using (var bmp = new Bitmap(width, height, PixelFormat.Format32bppArgb))
                 {
@@ -417,6 +525,26 @@ namespace PerfTray
                         // fast unsichtbarer Hintergrund, damit das Fenster Mausklicks bekommt
                         g.Clear(Color.FromArgb(1, 0, 0, 0));
                         float x = pad;
+
+                        favCells.Clear();
+                        for (int f = 0; f < favs.Count; f++)
+                        {
+                            var cell = new Rectangle((int)x + f * cellW, (height - cellH) / 2, cellW, cellH);
+                            favCells.Add(cell);
+                            if (f == hoveredFav)
+                            {
+                                using (var hb = new SolidBrush(light ? Color.FromArgb(28, 0, 0, 0) : Color.FromArgb(40, 255, 255, 255)))
+                                using (var rr = RoundedRect(cell, barH * 0.12f))
+                                {
+                                    g.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
+                                    g.FillPath(hb, rr);
+                                }
+                            }
+                            Lucide.Draw(g, FavIcon(favs[f]), new RectangleF(
+                                cell.X + (cellW - iconPx) / 2f, cell.Y + (cellH - iconPx) / 2f, iconPx, iconPx), textColor);
+                        }
+                        x += favW;
+
                         for (int c = 0; c < cols.Count; c++)
                         {
                             for (int r = 0; r < cols[c].Count; r++)
@@ -437,6 +565,18 @@ namespace PerfTray
                     lastBounds = new Rectangle(left, ypos, width, height);
                 }
             }
+        }
+
+        static System.Drawing.Drawing2D.GraphicsPath RoundedRect(Rectangle r, float radius)
+        {
+            float d = radius * 2;
+            var gp = new System.Drawing.Drawing2D.GraphicsPath();
+            gp.AddArc(r.X, r.Y, d, d, 180, 90);
+            gp.AddArc(r.Right - d, r.Y, d, d, 270, 90);
+            gp.AddArc(r.Right - d, r.Bottom - d, d, d, 0, 90);
+            gp.AddArc(r.X, r.Bottom - d, d, d, 90, 90);
+            gp.CloseFigure();
+            return gp;
         }
 
         void Present(Bitmap bmp, int x, int y)
@@ -506,7 +646,7 @@ namespace PerfTray
         protected override void OnMouseMove(MouseEventArgs e)
         {
             base.OnMouseMove(e);
-            if (!mouseDown) return;
+            if (!mouseDown) { UpdateHover(e.Location); return; }
             int dx = Cursor.Position.X - dragStartCursor.X;
             if (!dragging && Math.Abs(dx) < 5) return;
             dragging = true;
@@ -522,11 +662,53 @@ namespace PerfTray
             bool wasDrag = dragging;
             mouseDown = dragging = false;
             if (wasDrag) { SaveSettings(); return; }
+
+            int fav = FavAt(e.Location);
+            if (e.Button == MouseButtons.Left && fav >= 0)
+            {
+                var list = OrderedFavorites().ToList();
+                if (fav < list.Count) OpenFavorite(list[fav]);
+                return;
+            }
             if (e.Button == MouseButtons.Left || e.Button == MouseButtons.Right)
             {
+                tip.Hide(this);
                 SetForegroundWindow(Handle);
                 menu.Show(Cursor.Position);
             }
+        }
+
+        protected override void OnMouseLeave(EventArgs e)
+        {
+            base.OnMouseLeave(e);
+            if (hoveredFav < 0) return;
+            hoveredFav = -1;
+            tip.Hide(this);
+            Cursor = Cursors.Default;
+            Render();
+        }
+
+        int FavAt(Point p)
+        {
+            for (int i = 0; i < favCells.Count; i++)
+                if (favCells[i].Contains(p)) return i;
+            return -1;
+        }
+
+        void UpdateHover(Point p)
+        {
+            int fav = FavAt(p);
+            if (fav == hoveredFav) return;
+            hoveredFav = fav;
+            Cursor = fav >= 0 ? Cursors.Hand : Cursors.Default;
+            if (fav >= 0)
+            {
+                var list = OrderedFavorites().ToList();
+                if (fav < list.Count)
+                    tip.Show(FavName(list[fav]), this, favCells[fav].X, -(int)(lastBounds.Height * 0.7f), 2500);
+            }
+            else tip.Hide(this);
+            Render();
         }
 
         // ---------------- Menue ----------------
@@ -554,6 +736,7 @@ namespace PerfTray
                 case "DISKACT": return T("Datenträger-Aktivität", "Disk activity");
             }
             string letter = id.Substring(id.IndexOf(':') + 1);
+            if (id.StartsWith("DISKFREE")) return T("Laufwerk ", "Drive ") + letter + T(": frei in GB", ": free in GB");
             return T("Laufwerk ", "Drive ") + letter + T(": belegt in ", ": used in ") + (id.StartsWith("DISK%") ? "%" : "GB");
         }
 
@@ -565,30 +748,59 @@ namespace PerfTray
             title.Font = new Font(title.Font, FontStyle.Bold);
             menu.Items.Add(title);
 
-            var ids = new List<string> { "CPU", "GPU", "RAM%", "RAMGB" };
-            foreach (var l in FixedDriveLetters()) { ids.Add("DISK%:" + l); ids.Add("DISKGB:" + l); }
-            ids.Add("DISKACT");
+            foreach (var id in new[] { "CPU", "GPU", "RAM%", "RAMGB", "DISKACT" })
+                menu.Items.Add(MetricItem(id));
 
-            foreach (var id in ids)
+            // Festplatten: belegt / frei pro Laufwerk
+            var drives = new ToolStripMenuItem(T("Festplatten", "Drives"));
+            drives.Image = Lucide.ToBitmap("hard-drive", 16, SystemColors.MenuText);
+            drives.DropDown.Closing += KeepOpenOnToggle;
+            bool firstDrive = true;
+            foreach (var l in FixedDriveLetters())
             {
-                string metric = id;
-                var it = new ToolStripMenuItem(NameFor(id)) { Checked = On(id) };
+                if (!firstDrive) drives.DropDownItems.Add(new ToolStripSeparator());
+                firstDrive = false;
+                foreach (var kind in new[] { "DISK%:", "DISKGB:", "DISKFREE:" })
+                    drives.DropDownItems.Add(MetricItem(kind + l));
+            }
+            menu.Items.Add(drives);
+
+            // Favoriten-Ordner
+            var favMenu = new ToolStripMenuItem(T("Favoriten-Ordner", "Favorite folders"));
+            favMenu.Image = Lucide.ToBitmap("folder", 16, SystemColors.MenuText);
+            favMenu.DropDown.Closing += KeepOpenOnToggle;
+            var favIds = KnownFavorites.ToList();
+            foreach (var l in FixedDriveLetters()) favIds.Add("PATH:" + l + ":\\");
+            favIds.AddRange(favorites.Where(f => f.StartsWith("PATH:") && !favIds.Contains(f)));
+            foreach (var id in favIds)
+            {
+                string fav = id;
+                string label = id.StartsWith("PATH:") && FavIcon(id) == "hard-drive"
+                    ? T("Laufwerk ", "Drive ") + FavPath(id).TrimEnd('\\')
+                    : FavName(id);
+                var it = new ToolStripMenuItem(label) { Checked = favorites.Contains(id) };
+                it.Image = Lucide.ToBitmap(FavIcon(id), 16, SystemColors.MenuText);
+                if (id.StartsWith("PATH:") && FavIcon(id) == "folder") it.ToolTipText = FavPath(id);
                 it.Click += (s, e) =>
                 {
-                    keepMenuOpen = true;
-                    if (On(metric))
+                    MarkKeepOpen();
+                    if (favorites.Contains(fav))
                     {
-                        if (enabled.Count == 1) return; // mindestens ein Wert muss bleiben, sonst ist nichts mehr anklickbar
-                        enabled.Remove(metric);
+                        if (favorites.Count == 1 && enabled.Count == 0) return;
+                        favorites.Remove(fav);
                     }
-                    else enabled.Add(metric);
-                    ((ToolStripMenuItem)s).Checked = On(metric);
-                    columnWidth.Clear();
+                    else favorites.Add(fav);
+                    ((ToolStripMenuItem)s).Checked = favorites.Contains(fav);
                     SaveSettings();
                     Render();
                 };
-                menu.Items.Add(it);
+                favMenu.DropDownItems.Add(it);
             }
+            favMenu.DropDownItems.Add(new ToolStripSeparator());
+            var add = new ToolStripMenuItem(T("Ordner hinzufügen…", "Add folder…"));
+            add.Click += (s, e) => AddCustomFolder();
+            favMenu.DropDownItems.Add(add);
+            menu.Items.Add(favMenu);
 
             menu.Items.Add(new ToolStripSeparator());
 
@@ -620,6 +832,40 @@ namespace PerfTray
             menu.Items.Add(exit);
         }
 
+        ToolStripMenuItem MetricItem(string id)
+        {
+            var it = new ToolStripMenuItem(NameFor(id)) { Checked = On(id) };
+            it.Click += (s, e) =>
+            {
+                MarkKeepOpen();
+                if (On(id))
+                {
+                    // mindestens etwas muss sichtbar bleiben, sonst ist nichts mehr anklickbar
+                    if (enabled.Count == 1 && favorites.Count == 0) return;
+                    enabled.Remove(id);
+                }
+                else enabled.Add(id);
+                ((ToolStripMenuItem)s).Checked = On(id);
+                columnWidth.Clear();
+                SaveSettings();
+                Render();
+            };
+            return it;
+        }
+
+        void AddCustomFolder()
+        {
+            using (var dlg = new FolderBrowserDialog())
+            {
+                dlg.Description = T("Ordner für die Taskleiste auswählen", "Choose a folder for the taskbar");
+                if (dlg.ShowDialog(this) != DialogResult.OK || string.IsNullOrEmpty(dlg.SelectedPath)) return;
+                string id = "PATH:" + dlg.SelectedPath;
+                if (!favorites.Contains(id)) favorites.Add(id);
+                SaveSettings();
+                Render();
+            }
+        }
+
         void Quit()
         {
             renderTimer.Stop();
@@ -643,17 +889,30 @@ namespace PerfTray
                         string k = line.Substring(0, eq).Trim(), v = line.Substring(eq + 1).Trim();
                         int n;
                         if (k == "metrics")
+                        {
+                            hasMetricsSetting = true;
                             enabled.AddRange(v.Split(new[] { ',' }, StringSplitOptions.RemoveEmptyEntries).Select(x => x.Trim()));
+                        }
                         else if (k == "interval" && int.TryParse(v, out n) && n >= 500)
                             sampler.IntervalMs = n;
                         else if (k == "fromRight" && int.TryParse(v, out n))
                             fromRight = n;
+                        else if (k == "favorites")
+                        {
+                            hasFavoritesSetting = true;
+                            // '|' kommt in Windows-Pfaden nicht vor
+                            favorites.AddRange(v.Split(new[] { '|' }, StringSplitOptions.RemoveEmptyEntries).Select(x => x.Trim()));
+                        }
                     }
                 }
             }
             catch { }
-            if (enabled.Count == 0) enabled.AddRange(new[] { "CPU", "GPU", "RAM%", "RAMGB" });
+            if (!hasFavoritesSetting) favorites.AddRange(new[] { "DOWNLOADS", "DOCUMENTS", "DESKTOP" });
+            if (enabled.Count == 0 && !hasMetricsSetting) enabled.AddRange(new[] { "CPU", "GPU", "RAM%", "RAMGB" });
+            if (enabled.Count == 0 && favorites.Count == 0) enabled.Add("CPU");
         }
+
+        bool hasFavoritesSetting, hasMetricsSetting;
 
         void SaveSettings()
         {
@@ -664,7 +923,8 @@ namespace PerfTray
                 {
                     "metrics=" + string.Join(",", enabled),
                     "interval=" + sampler.IntervalMs,
-                    "fromRight=" + fromRight
+                    "fromRight=" + fromRight,
+                    "favorites=" + string.Join("|", favorites)
                 });
             }
             catch { }
