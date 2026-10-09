@@ -217,9 +217,13 @@ namespace PerfTray
         readonly Sampler sampler = new Sampler();
         readonly List<string> enabled = new List<string>();
         readonly List<string> favorites = new List<string>(); // Kennung wie "DOWNLOADS" oder "PATH:D:\Projekte"
-        readonly List<Rectangle> favCells = new List<Rectangle>(); // Klickflaechen der Favoriten (Fensterkoordinaten)
+        // Klickflaechen (Favoriten, Medien-Buttons) in Fensterkoordinaten, werden bei jedem Zeichnen neu gesetzt
+        class HitArea { public Rectangle R; public string Key, Tip; public Action Click; }
+        readonly List<HitArea> hits = new List<HitArea>();
         readonly ToolTip tip = new ToolTip();
-        int hoveredFav = -1;
+        string hoveredKey;
+        readonly MediaWatcher media = new MediaWatcher();
+        bool showMedia = true, showCover = true;
         readonly Dictionary<string, float> columnWidth = new Dictionary<string, float>(); // waechst nur -> kein Zappeln
         readonly ContextMenuStrip menu = new ContextMenuStrip();
         readonly System.Windows.Forms.Timer renderTimer = new System.Windows.Forms.Timer();
@@ -242,6 +246,8 @@ namespace PerfTray
 
             LoadSettings();
             sampler.Start();
+            media.Enabled = showMedia;
+            try { media.Start(); } catch { media.Available = false; }
 
             menu.Opening += (s, e) => BuildMenu();
             menu.Closing += KeepOpenOnToggle;
@@ -470,15 +476,19 @@ namespace PerfTray
             catch { return false; }
         }
 
-        void Render()
+        List<Item> cachedItems;
+        bool cachedLight;
+
+        // fast = Animations-Frame: Messwerte und Design vom letzten normalen Zeichnen wiederverwenden
+        void Render(bool fast = false)
         {
             if (!IsHandleCreated) return;
             Rectangle tb = TaskbarRect();
             int barH = Math.Max(24, Math.Min(tb.Height, 80));
             float fontPx = Math.Max(11f, barH * 0.29f);
-            var items = BuildItems();
+            var items = fast && cachedItems != null ? cachedItems : (cachedItems = BuildItems());
             int rows = barH >= fontPx * 2.5f ? 2 : 1;
-            bool light = LightTheme();
+            bool light = fast ? cachedLight : (cachedLight = LightTheme());
             Color textColor = light ? Color.FromArgb(20, 20, 20) : Color.White;
             Color hotColor = light ? Color.FromArgb(200, 30, 30) : Color.FromArgb(255, 110, 100);
 
@@ -505,17 +515,36 @@ namespace PerfTray
 
                 float pad = fontPx * 0.5f, gap = fontPx * 1.2f, lineH = fontPx * 1.32f;
 
-                // Favoriten links vor den Werten
+                // Abschnitte von links nach rechts: Favoriten | Medien | Werte
                 var favs = OrderedFavorites().ToList();
                 int cellW = (int)Math.Round(barH * 0.72f), cellH = (int)Math.Round(barH * 0.8f);
                 float iconPx = (float)Math.Round(barH * 0.42f);
-                float favW = favs.Count * cellW + (favs.Count > 0 && cols.Count > 0 ? gap * 0.6f : 0);
+                float favW = favs.Count * cellW;
 
-                int width = (int)Math.Ceiling(pad * 2 + favW + widths.Sum() + gap * Math.Max(0, cols.Count - 1));
+                var mi = showMedia ? media.Current : null;
+                int btnW = (int)Math.Round(barH * 0.62f);
+                float coverPx = (float)Math.Round(barH * 0.66f);
+                string line1 = "", line2 = "";
+                float textW = 0, mediaW = 0;
+                if (mi != null)
+                {
+                    line1 = rows == 1 && mi.Artist.Length > 0 ? mi.Title + " – " + mi.Artist : mi.Title;
+                    line2 = rows == 1 ? "" : mi.Artist;
+                    float measured = Math.Max(pg.MeasureString(line1, font, 4000, fmt).Width,
+                                              pg.MeasureString(line2, font, 4000, fmt).Width);
+                    textW = (float)Math.Ceiling(Math.Min(fontPx * 11f, measured) + 2);
+                    if (hudActive) textW = Math.Max(textW, (float)Math.Ceiling(fontPx * 8.5f)); // Platz fuer die Lautstaerke-Anzeige
+                    mediaW = (showCover ? coverPx + fontPx * 0.5f : 0) + textW + fontPx * 0.4f + 3 * btnW;
+                }
+                float statsW = widths.Sum() + gap * Math.Max(0, cols.Count - 1);
+
+                var sections = new[] { favW, mediaW, statsW }.Where(w => w > 0).ToList();
+                float sectionGap = gap * 0.8f;
+                int width = (int)Math.Ceiling(pad * 2 + sections.Sum() + sectionGap * Math.Max(0, sections.Count - 1));
                 width = Math.Max(width, 20);
                 int height = barH;
                 float top = (height - rows * lineH) / 2f;
-                if (hoveredFav >= favs.Count) hoveredFav = -1;
+                float radius = barH * 0.12f;
 
                 using (var bmp = new Bitmap(width, height, PixelFormat.Format32bppArgb))
                 {
@@ -526,24 +555,64 @@ namespace PerfTray
                         g.Clear(Color.FromArgb(1, 0, 0, 0));
                         float x = pad;
 
-                        favCells.Clear();
+                        hits.Clear();
+                        int cellY = (height - cellH) / 2;
+
+                        // Favoriten
                         for (int f = 0; f < favs.Count; f++)
                         {
-                            var cell = new Rectangle((int)x + f * cellW, (height - cellH) / 2, cellW, cellH);
-                            favCells.Add(cell);
-                            if (f == hoveredFav)
-                            {
-                                using (var hb = new SolidBrush(light ? Color.FromArgb(28, 0, 0, 0) : Color.FromArgb(40, 255, 255, 255)))
-                                using (var rr = RoundedRect(cell, barH * 0.12f))
-                                {
-                                    g.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
-                                    g.FillPath(hb, rr);
-                                }
-                            }
-                            Lucide.Draw(g, FavIcon(favs[f]), new RectangleF(
-                                cell.X + (cellW - iconPx) / 2f, cell.Y + (cellH - iconPx) / 2f, iconPx, iconPx), textColor);
+                            string fav = favs[f];
+                            DrawButton(g, new Rectangle((int)x + f * cellW, cellY, cellW, cellH), "fav:" + fav,
+                                FavIcon(fav), iconPx, textColor, light, radius, FavName(fav), () => OpenFavorite(fav));
                         }
-                        x += favW;
+                        if (favW > 0) x += favW + sectionGap;
+
+                        // Medien: Cover | Titel + Interpret | Zurueck, Play/Pause, Weiter
+                        if (mi != null)
+                        {
+                            if (showCover)
+                            {
+                                var cr = new RectangleF(x, (height - coverPx) / 2f, coverPx, coverPx);
+                                DrawCover(g, mi.Cover, cr, textColor, iconPx);
+                                hits.Add(new HitArea { R = new Rectangle((int)x, 0, (int)coverPx, height), Key = "media:cover" });
+                                x += coverPx + fontPx * 0.5f;
+                            }
+                            var tf = new StringFormat(StringFormat.GenericTypographic);
+                            tf.Trimming = StringTrimming.EllipsisCharacter;
+                            // ohne LineLimit: sonst verschwindet eine Zeile ganz, wenn das Feld minimal zu niedrig ist
+                            tf.FormatFlags = StringFormatFlags.NoWrap | StringFormatFlags.NoClip;
+                            float y1 = rows == 1 ? (height - lineH) / 2f : top;
+                            float boxH = lineH + fontPx * 0.5f;
+                            if (hudActive)
+                                DrawVolumeHud(g, new RectangleF(x, 0, textW, height), font, textColor, iconPx, fontPx);
+                            else
+                            {
+                                using (var br = new SolidBrush(textColor))
+                                    g.DrawString(line1, font, br, new RectangleF(x, y1 + fontPx * 0.12f, textW, boxH), tf);
+                                if (line2.Length > 0)
+                                    using (var br = new SolidBrush(Color.FromArgb(170, textColor)))
+                                        g.DrawString(line2, font, br, new RectangleF(x, top + lineH + fontPx * 0.12f, textW, boxH), tf);
+                            }
+                            hits.Add(new HitArea
+                            {
+                                R = new Rectangle((int)x, 0, (int)textW, height),
+                                Key = "media:text",
+                                Tip = mi.Artist.Length > 0 ? mi.Title + "\n" + mi.Artist : mi.Title
+                            });
+                            x += textW + fontPx * 0.4f;
+
+                            float bIcon = (float)Math.Round(iconPx * 0.85f);
+                            DrawButton(g, new Rectangle((int)x, cellY, btnW, cellH), "media:prev", "skip-back", bIcon,
+                                mi.CanPrev ? textColor : Color.FromArgb(90, textColor), light, radius,
+                                T("Zurück", "Previous"), mi.CanPrev ? (Action)(() => MediaCommand("prev")) : null);
+                            DrawButton(g, new Rectangle((int)x + btnW, cellY, btnW, cellH), "media:play",
+                                mi.Playing ? "pause" : "play", bIcon, textColor, light, radius,
+                                mi.Playing ? T("Pause", "Pause") : T("Abspielen", "Play"), () => MediaCommand("toggle"));
+                            DrawButton(g, new Rectangle((int)x + 2 * btnW, cellY, btnW, cellH), "media:next", "skip-forward", bIcon,
+                                mi.CanNext ? textColor : Color.FromArgb(90, textColor), light, radius,
+                                T("Weiter", "Next"), mi.CanNext ? (Action)(() => MediaCommand("next")) : null);
+                            x += 3 * btnW + sectionGap;
+                        }
 
                         for (int c = 0; c < cols.Count; c++)
                         {
@@ -565,6 +634,71 @@ namespace PerfTray
                     lastBounds = new Rectangle(left, ypos, width, height);
                 }
             }
+        }
+
+        // Icon-Button mit Hover-Hervorhebung; registriert die Klickflaeche
+        void DrawButton(Graphics g, Rectangle cell, string key, string icon, float iconPx, Color color,
+                        bool light, float radius, string tipText, Action click)
+        {
+            if (click != null && key == hoveredKey)
+            {
+                using (var hb = new SolidBrush(light ? Color.FromArgb(28, 0, 0, 0) : Color.FromArgb(40, 255, 255, 255)))
+                using (var rr = RoundedRect(cell, radius))
+                {
+                    g.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
+                    g.FillPath(hb, rr);
+                }
+            }
+            Lucide.Draw(g, icon, new RectangleF(
+                cell.X + (cell.Width - iconPx) / 2f, cell.Y + (cell.Height - iconPx) / 2f, iconPx, iconPx), color);
+            hits.Add(new HitArea { R = cell, Key = key, Tip = tipText, Click = click });
+        }
+
+        // Cover quadratisch zugeschnitten mit runden Ecken; ohne Cover ein Musik-Icon
+        static void DrawCover(Graphics g, Bitmap cover, RectangleF r, Color color, float iconPx)
+        {
+            g.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
+            using (var clip = RoundedRect(Rectangle.Round(r), r.Width * 0.15f))
+            {
+                if (cover == null)
+                {
+                    using (var bg = new SolidBrush(Color.FromArgb(40, color))) g.FillPath(bg, clip);
+                    float s = iconPx * 0.8f;
+                    Lucide.Draw(g, "music", new RectangleF(r.X + (r.Width - s) / 2, r.Y + (r.Height - s) / 2, s, s), color);
+                    return;
+                }
+                var state = g.Save();
+                g.SetClip(clip);
+                g.InterpolationMode = System.Drawing.Drawing2D.InterpolationMode.HighQualityBicubic;
+                int side = Math.Min(cover.Width, cover.Height);
+                var src = new Rectangle((cover.Width - side) / 2, (cover.Height - side) / 2, side, side);
+                g.DrawImage(cover, Rectangle.Round(r), src, GraphicsUnit.Pixel);
+                g.Restore(state);
+            }
+        }
+
+        readonly System.Windows.Forms.Timer refreshSoon = new System.Windows.Forms.Timer();
+
+        void MediaCommand(string what)
+        {
+            switch (what)
+            {
+                case "prev": media.Previous(); break;
+                case "next": media.Next(); break;
+                case "stop": media.StopPlayback(); break;
+                case "shuffle": media.ToggleShuffle(); break;
+                case "repeat": media.CycleRepeat(); break;
+                case "back10": media.Seek(-10); break;
+                case "fwd10": media.Seek(10); break;
+                default: media.Toggle(); break;
+            }
+            MediaCommandRefresh();
+        }
+
+        void RefreshSoonTick(object sender, EventArgs e)
+        {
+            refreshSoon.Stop();
+            Render();
         }
 
         static System.Drawing.Drawing2D.GraphicsPath RoundedRect(Rectangle r, float radius)
@@ -663,11 +797,15 @@ namespace PerfTray
             mouseDown = dragging = false;
             if (wasDrag) { SaveSettings(); return; }
 
-            int fav = FavAt(e.Location);
-            if (e.Button == MouseButtons.Left && fav >= 0)
+            var hit = HitAt(e.Location);
+            if (e.Button == MouseButtons.Left && hit != null && hit.Click != null)
             {
-                var list = OrderedFavorites().ToList();
-                if (fav < list.Count) OpenFavorite(list[fav]);
+                hit.Click();
+                return;
+            }
+            if (e.Button == MouseButtons.Right && hit != null && hit.Key.StartsWith("media:") && media.Current != null)
+            {
+                ShowTrackMenu();
                 return;
             }
             if (e.Button == MouseButtons.Left || e.Button == MouseButtons.Right)
@@ -681,31 +819,320 @@ namespace PerfTray
         protected override void OnMouseLeave(EventArgs e)
         {
             base.OnMouseLeave(e);
-            if (hoveredFav < 0) return;
-            hoveredFav = -1;
+            if (hoveredKey == null) return;
+            hoveredKey = null;
             tip.Hide(this);
             Cursor = Cursors.Default;
             Render();
         }
 
-        int FavAt(Point p)
+        // Mausrad ueber dem Track = Lautstaerke des Players (wie im Windows-Lautstaerkemixer)
+        protected override void OnMouseWheel(MouseEventArgs e)
         {
-            for (int i = 0; i < favCells.Count; i++)
-                if (favCells[i].Contains(p)) return i;
-            return -1;
+            base.OnMouseWheel(e);
+            var mi = media.Current;
+            var hit = HitAt(e.Location);
+            if (mi == null || hit == null || !hit.Key.StartsWith("media:")) return;
+            string proc = MediaWatcher.ProcessName(mi.SourceApp);
+            float delta = e.Delta / 120f * 0.05f;
+            float? level = AppVolume.Change(proc, delta);
+            if (!level.HasValue)
+            {
+                string app = MediaWatcher.AppName(mi.SourceApp);
+                tip.Show(T("Lautstärke von ", "Can't change volume of ") + app + T(" nicht änderbar", ""),
+                    this, hit.R.X, -(int)(lastBounds.Height * 0.72f), 1500);
+                hoveredKey = null;
+                return;
+            }
+            tip.Hide(this);
+            if (!hudActive)
+            {
+                hudShown = Math.Max(0f, Math.Min(1f, level.Value - delta)); // von der alten Lautstaerke aus animieren
+                hudMuted = AppVolume.IsMuted(proc) == true;
+                hudClock.Restart();
+            }
+            hudTarget = level.Value;
+            hudKick = 1f;
+            hudUntil = DateTime.UtcNow.AddMilliseconds(1600);
+            hudActive = true;
+            if (!hudTimer.Enabled)
+            {
+                hudTimer.Interval = 16;
+                hudTimer.Tick -= HudTick;
+                hudTimer.Tick += HudTick;
+                hudTimer.Start();
+            }
+        }
+
+        // ---------------- Lautstaerke-Animation ----------------
+
+        readonly System.Windows.Forms.Timer hudTimer = new System.Windows.Forms.Timer();
+        readonly Stopwatch hudClock = new Stopwatch();
+        bool hudActive, hudMuted;
+        float hudTarget, hudShown, hudKick;
+        DateTime hudUntil;
+
+        void HudTick(object sender, EventArgs e)
+        {
+            if (DateTime.UtcNow > hudUntil)
+            {
+                hudTimer.Stop();
+                hudActive = false;
+                Render();
+                return;
+            }
+            hudShown += (hudTarget - hudShown) * 0.22f; // weich zur neuen Lautstaerke gleiten
+            hudKick *= 0.9f;                            // kurzer "Puls" bei jedem Mausrad-Schritt
+            Render(true);
+        }
+
+        // Lautsprecher-Icon | huepfende Equalizer-Balken (Anzahl leuchtender Balken + Hoehe = Lautstaerke) | Prozent
+        void DrawVolumeHud(Graphics g, RectangleF r, Font font, Color color, float iconPx, float fontPx)
+        {
+            float lvl = hudMuted ? 0 : Math.Max(0f, Math.Min(1f, hudShown));
+            float t = (float)hudClock.Elapsed.TotalSeconds;
+            var fmt = StringFormat.GenericTypographic;
+
+            string icon = hudMuted || hudTarget <= 0.001f ? "volume-x" : hudTarget < 0.5f ? "volume-1" : "volume-2";
+            float ic = (float)Math.Round(iconPx * 0.95f);
+            Lucide.Draw(g, icon, new RectangleF(r.X, r.Y + (r.Height - ic) / 2f, ic, ic), color);
+
+            string pct = hudMuted ? T("stumm", "muted") : (int)Math.Round(hudTarget * 100) + "%";
+            float pctW = Math.Max(g.MeasureString("100%", font, 400, fmt).Width, g.MeasureString(pct, font, 400, fmt).Width);
+            float pctActual = g.MeasureString(pct, font, 400, fmt).Width;
+            using (var br = new SolidBrush(color))
+                g.DrawString(pct, font, br, r.Right - pctActual, r.Y + (r.Height - fontPx * 1.2f) / 2f, fmt);
+
+            float bx0 = r.X + ic + fontPx * 0.55f, bx1 = r.Right - pctW - fontPx * 0.55f;
+            float barW = Math.Max(2f, (float)Math.Round(fontPx * 0.2f)), step = barW * 1.9f;
+            int n = Math.Max(5, (int)((bx1 - bx0 + (step - barW)) / step));
+            float used = n * step - (step - barW);
+            float sx = bx0 + ((bx1 - bx0) - used) / 2f;
+            float maxH = r.Height * 0.62f, cy = r.Y + r.Height / 2f;
+
+            g.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
+            using (var on = new SolidBrush(color))
+            using (var off = new SolidBrush(Color.FromArgb(70, color)))
+            {
+                for (int i = 0; i < n; i++)
+                {
+                    bool lit = (i + 0.5f) / n <= lvl + 0.0001f;
+                    float wave = 0.3f + 0.7f * Math.Abs((float)(Math.Sin(t * 7.0 + i * 0.8) * Math.Cos(t * 2.7 + i * 0.33)));
+                    float h = lit ? maxH * wave * (0.3f + 0.7f * lvl) * (1f + 0.35f * hudKick) : barW;
+                    h = Math.Max(barW, Math.Min(h, r.Height * 0.9f));
+                    var bar = new RectangleF(sx + i * step, cy - h / 2f, barW, h);
+                    using (var p = RoundedRectF(bar, barW / 2f))
+                        g.FillPath(lit ? on : off, p);
+                }
+            }
+        }
+
+        static System.Drawing.Drawing2D.GraphicsPath RoundedRectF(RectangleF r, float radius)
+        {
+            float d = Math.Min(radius * 2, Math.Min(r.Width, r.Height));
+            var gp = new System.Drawing.Drawing2D.GraphicsPath();
+            if (d <= 0.5f) { gp.AddRectangle(r); return gp; }
+            gp.AddArc(r.X, r.Y, d, d, 180, 90);
+            gp.AddArc(r.Right - d, r.Y, d, d, 270, 90);
+            gp.AddArc(r.Right - d, r.Bottom - d, d, d, 0, 90);
+            gp.AddArc(r.X, r.Bottom - d, d, d, 90, 90);
+            gp.CloseFigure();
+            return gp;
+        }
+
+        // ---------------- Track-Menue (Rechtsklick auf den laufenden Titel) ----------------
+
+        ContextMenuStrip trackMenu;
+
+        static void OpenUrl(string url)
+        {
+            try { Process.Start(url); } catch { }
+        }
+
+        static string SongQuery(string title, string artist)
+        {
+            return string.IsNullOrEmpty(artist) ? title : artist + " " + title;
+        }
+
+        static string SongLabel(string title, string artist)
+        {
+            return string.IsNullOrEmpty(artist) ? title : artist + " – " + title;
+        }
+
+        static ToolStripMenuItem MenuItem(string text, string icon, Action click)
+        {
+            var it = new ToolStripMenuItem(text);
+            if (icon != null) it.Image = Lucide.ToBitmap(icon, 16, SystemColors.MenuText);
+            if (click != null) it.Click += (s, e) => click();
+            return it;
+        }
+
+        // Kopieren, Songtext, Suchen auf ... - fuer den aktuellen Titel und fuer den Verlauf
+        static void AddSongActions(ToolStripItemCollection items, string title, string artist)
+        {
+            string q = Uri.EscapeDataString(SongQuery(title, artist));
+            items.Add(MenuItem(T("„Interpret – Titel“ kopieren", "Copy \"Artist – Title\""), "copy",
+                () => { try { Clipboard.SetText(SongLabel(title, artist)); } catch { } }));
+            items.Add(MenuItem(T("Songtext suchen", "Find lyrics"), "mic-vocal",
+                () => OpenUrl("https://genius.com/search?q=" + q)));
+            var search = MenuItem(T("Suchen auf", "Search on"), "search", null);
+            search.DropDownItems.Add(MenuItem("YouTube Music", null, () => OpenUrl("https://music.youtube.com/search?q=" + q)));
+            search.DropDownItems.Add(MenuItem("Spotify", null, () => OpenUrl("https://open.spotify.com/search/" + q)));
+            search.DropDownItems.Add(MenuItem("YouTube", null, () => OpenUrl("https://www.youtube.com/results?search_query=" + q)));
+            search.DropDownItems.Add(MenuItem("Google", null, () => OpenUrl("https://www.google.com/search?q=" + q)));
+            items.Add(search);
+        }
+
+        void ShowTrackMenu()
+        {
+            var mi = media.Current;
+            if (mi == null) return;
+            if (trackMenu != null) trackMenu.Dispose();
+            trackMenu = new ContextMenuStrip();
+            var items = trackMenu.Items;
+
+            var head = new ToolStripMenuItem(mi.Title) { Enabled = false };
+            head.Font = new Font(head.Font, FontStyle.Bold);
+            items.Add(head);
+            if (mi.Artist.Length > 0) items.Add(new ToolStripMenuItem(mi.Artist) { Enabled = false });
+            items.Add(new ToolStripSeparator());
+
+            AddSongActions(items, mi.Title, mi.Artist);
+            var save = MenuItem(T("Cover speichern…", "Save cover…"), "image-down", () => SaveCover(mi));
+            save.Enabled = mi.Cover != null;
+            items.Add(save);
+
+            // Steuerung, die nicht jeder Player unterstuetzt - nur zeigen, was geht
+            var player = new List<ToolStripItem>();
+            if (mi.CanSeek)
+            {
+                player.Add(MenuItem(T("10 s zurück", "Back 10 s"), "rewind", () => MediaCommand("back10")));
+                player.Add(MenuItem(T("10 s vor", "Forward 10 s"), "fast-forward", () => MediaCommand("fwd10")));
+            }
+            if (mi.CanShuffle)
+            {
+                var sh = MenuItem(T("Zufallswiedergabe", "Shuffle"), "shuffle", () => MediaCommand("shuffle"));
+                sh.Checked = mi.Shuffle == true;
+                player.Add(sh);
+            }
+            if (mi.CanRepeat)
+            {
+                string mode = mi.Repeat == 1 ? T("Titel", "Track") : mi.Repeat == 2 ? T("Alle", "All") : T("Aus", "Off");
+                player.Add(MenuItem(T("Wiederholen: ", "Repeat: ") + mode, mi.Repeat == 1 ? "repeat-1" : "repeat", () => MediaCommand("repeat")));
+            }
+            if (mi.CanStop) player.Add(MenuItem(T("Stopp", "Stop"), "square", () => MediaCommand("stop")));
+            if (player.Count > 0)
+            {
+                items.Add(new ToolStripSeparator());
+                foreach (var p in player) items.Add(p);
+            }
+
+            // Lautstaerke des Players
+            string proc = MediaWatcher.ProcessName(mi.SourceApp);
+            float? vol = AppVolume.Get(proc);
+            if (vol.HasValue)
+            {
+                items.Add(new ToolStripSeparator());
+                string app = MediaWatcher.AppName(mi.SourceApp);
+                items.Add(new ToolStripMenuItem(T("Lautstärke ", "Volume ") + app + ": " + (int)Math.Round(vol.Value * 100) + " %  " +
+                    T("(Mausrad über dem Titel)", "(mouse wheel over the track)")) { Enabled = false, Image = Lucide.ToBitmap("volume-2", 16, SystemColors.GrayText) });
+                bool muted = AppVolume.IsMuted(proc) == true;
+                var mute = MenuItem(T("Stummschalten", "Mute"), null, () => AppVolume.SetMute(proc, !muted));
+                mute.Checked = muted;
+                items.Add(mute);
+            }
+
+            items.Add(new ToolStripSeparator());
+
+            // Zuletzt gehoert
+            var hist = MenuItem(T("Zuletzt gehört", "Recently played"), "history", null);
+            foreach (var h in media.History())
+            {
+                var entry = new ToolStripMenuItem(SongLabel(h.Title, h.Artist) + "   (" + h.Time.ToString("HH:mm") + ", " + h.Source + ")");
+                AddSongActions(entry.DropDownItems, h.Title, h.Artist);
+                hist.DropDownItems.Add(entry);
+            }
+            if (hist.DropDownItems.Count == 0) hist.Enabled = false;
+            items.Add(hist);
+
+            // Quelle waehlen, wenn mehrere Player laufen
+            var sources = media.Sources;
+            var src = MenuItem(T("Quelle", "Source"), "audio-lines", null);
+            var auto = MenuItem(T("Automatisch (wie Windows)", "Automatic (like Windows)"), null, () => SetSource(null));
+            auto.Checked = media.PreferredAumid == null;
+            src.DropDownItems.Add(auto);
+            foreach (var s in sources)
+            {
+                string aumid = s.Aumid;
+                var it = MenuItem(s.Name + (s.Title.Length > 0 ? " – " + s.Title : ""), null, () => SetSource(aumid));
+                it.Checked = media.PreferredAumid == aumid;
+                src.DropDownItems.Add(it);
+            }
+            items.Add(src);
+
+            items.Add(new ToolStripSeparator());
+            items.Add(MenuItem(T("PerfTray-Einstellungen…", "PerfTray settings…"), null,
+                () => BeginInvoke((Action)(() => { SetForegroundWindow(Handle); menu.Show(Cursor.Position); }))));
+
+            tip.Hide(this);
+            SetForegroundWindow(Handle);
+            trackMenu.Show(Cursor.Position);
+        }
+
+        void SetSource(string aumid)
+        {
+            media.PreferredAumid = aumid;
+            media.Refresh();
+            SaveSettings();
+            MediaCommandRefresh();
+        }
+
+        // kurz darauf neu zeichnen, damit z. B. Play/Pause sofort umspringt
+        void MediaCommandRefresh()
+        {
+            refreshSoon.Stop();
+            refreshSoon.Interval = 400;
+            refreshSoon.Tick -= RefreshSoonTick;
+            refreshSoon.Tick += RefreshSoonTick;
+            refreshSoon.Start();
+        }
+
+        void SaveCover(MediaInfo mi)
+        {
+            if (mi.Cover == null) return;
+            string name = SongLabel(mi.Title, mi.Artist);
+            foreach (char c in Path.GetInvalidFileNameChars()) name = name.Replace(c, '_');
+            if (name.Length > 100) name = name.Substring(0, 100);
+            using (var dlg = new SaveFileDialog())
+            {
+                dlg.Filter = "PNG|*.png";
+                dlg.FileName = name + ".png";
+                dlg.InitialDirectory = FavPath("PICTURES") ?? "";
+                if (dlg.ShowDialog(this) != DialogResult.OK) return;
+                try { mi.Cover.Save(dlg.FileName, ImageFormat.Png); }
+                catch (Exception ex)
+                {
+                    MessageBox.Show(ex.Message, "PerfTray", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                }
+            }
+        }
+
+        HitArea HitAt(Point p)
+        {
+            return hits.FirstOrDefault(h => h.R.Contains(p));
         }
 
         void UpdateHover(Point p)
         {
-            int fav = FavAt(p);
-            if (fav == hoveredFav) return;
-            hoveredFav = fav;
-            Cursor = fav >= 0 ? Cursors.Hand : Cursors.Default;
-            if (fav >= 0)
+            var hit = HitAt(p);
+            string key = hit == null ? null : hit.Key;
+            if (key == hoveredKey) return;
+            hoveredKey = key;
+            Cursor = hit != null && hit.Click != null ? Cursors.Hand : Cursors.Default;
+            if (hit != null && !string.IsNullOrEmpty(hit.Tip))
             {
-                var list = OrderedFavorites().ToList();
-                if (fav < list.Count)
-                    tip.Show(FavName(list[fav]), this, favCells[fav].X, -(int)(lastBounds.Height * 0.7f), 2500);
+                int lines = hit.Tip.Split('\n').Length;
+                tip.Show(hit.Tip, this, hit.R.X, -(int)(lastBounds.Height * (0.4f + 0.32f * lines)), 4000);
             }
             else tip.Hide(this);
             Render();
@@ -802,6 +1229,41 @@ namespace PerfTray
             favMenu.DropDownItems.Add(add);
             menu.Items.Add(favMenu);
 
+            // Medien-Steuerung (YouTube Music, Spotify, ...)
+            var mediaMenu = new ToolStripMenuItem(T("Medien-Steuerung", "Media controls"));
+            mediaMenu.Image = Lucide.ToBitmap("music", 16, SystemColors.MenuText);
+            mediaMenu.DropDown.Closing += KeepOpenOnToggle;
+            if (!media.Available)
+            {
+                mediaMenu.DropDownItems.Add(new ToolStripMenuItem(
+                    T("Auf diesem Windows nicht verfügbar", "Not available on this Windows version")) { Enabled = false });
+            }
+            else
+            {
+                var showIt = new ToolStripMenuItem(T("Anzeigen, wenn etwas läuft", "Show when something is playing")) { Checked = showMedia };
+                showIt.Click += (s, e) =>
+                {
+                    MarkKeepOpen();
+                    showMedia = !showMedia;
+                    media.Enabled = showMedia;
+                    ((ToolStripMenuItem)s).Checked = showMedia;
+                    SaveSettings();
+                    Render();
+                };
+                var coverIt = new ToolStripMenuItem(T("Cover anzeigen", "Show cover art")) { Checked = showCover };
+                coverIt.Click += (s, e) =>
+                {
+                    MarkKeepOpen();
+                    showCover = !showCover;
+                    ((ToolStripMenuItem)s).Checked = showCover;
+                    SaveSettings();
+                    Render();
+                };
+                mediaMenu.DropDownItems.Add(showIt);
+                mediaMenu.DropDownItems.Add(coverIt);
+            }
+            menu.Items.Add(mediaMenu);
+
             menu.Items.Add(new ToolStripSeparator());
 
             var interval = new ToolStripMenuItem(T("Aktualisierung", "Update interval"));
@@ -871,6 +1333,7 @@ namespace PerfTray
             renderTimer.Stop();
             zTimer.Stop();
             sampler.Stop();
+            media.Stop();
             Close();
         }
 
@@ -897,6 +1360,12 @@ namespace PerfTray
                             sampler.IntervalMs = n;
                         else if (k == "fromRight" && int.TryParse(v, out n))
                             fromRight = n;
+                        else if (k == "media")
+                            showMedia = v != "0";
+                        else if (k == "cover")
+                            showCover = v != "0";
+                        else if (k == "source" && v.Length > 0)
+                            media.PreferredAumid = v;
                         else if (k == "favorites")
                         {
                             hasFavoritesSetting = true;
@@ -924,7 +1393,10 @@ namespace PerfTray
                     "metrics=" + string.Join(",", enabled),
                     "interval=" + sampler.IntervalMs,
                     "fromRight=" + fromRight,
-                    "favorites=" + string.Join("|", favorites)
+                    "favorites=" + string.Join("|", favorites),
+                    "media=" + (showMedia ? "1" : "0"),
+                    "cover=" + (showCover ? "1" : "0"),
+                    "source=" + (media.PreferredAumid ?? "")
                 });
             }
             catch { }

@@ -2,7 +2,8 @@
 
 PerfTray contains icon path data from **Lucide** (https://lucide.dev, package `lucide-static` 1.54.0),
 the icon set used by shadcn/ui. Icons used: house, download, file-text, image, monitor, music, video,
-folder, trash-2, hard-drive (see `Lucide.cs`).
+folder, trash-2, hard-drive, skip-back, play, pause, skip-forward, copy, search, mic-vocal, image-down,
+history, shuffle, repeat, repeat-1, square, rewind, fast-forward, volume-2, audio-lines (see `Lucide.cs`).
 
 ## Lucide – ISC License
 
@@ -26,7 +27,7 @@ OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
 
 ## Feather – MIT License
 
-The Lucide icons `download`, `monitor`, `music` and `trash-2` are derived from the Feather project.
+The Lucide icons `download`, `monitor`, `music`, `search`, `square` and `trash-2` are derived from the Feather project.
 
 ```
 The MIT License (MIT)
